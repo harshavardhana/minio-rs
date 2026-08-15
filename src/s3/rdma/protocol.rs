@@ -29,7 +29,7 @@ use crate::s3::signer::sign_v4_s3;
 use crate::s3::types::{BucketName, ObjectKey, Region};
 use crate::s3::utils::{to_amz_date, utc_now};
 
-use super::cuobj::{CuObjClient, OpType};
+use super::transport::RdmaClient;
 
 pub const X_AMZ_RDMA_TOKEN: &str = "x-amz-rdma-token";
 pub const X_AMZ_RDMA_REPLY: &str = "x-amz-rdma-reply";
@@ -43,6 +43,25 @@ pub const RDMA_REPLY_PARTIAL_CONTENT: i32 = 206;
 pub const RDMA_REPLY_NOT_IMPLEMENTED: i32 = 501;
 
 pub const RDMA_NOT_SUPPORTED: isize = -2;
+
+/// The attempt failed for a reason that does not implicate the rail: a bad
+/// argument, a URL that would not build, or a 4xx from the server. The first
+/// two never reached the fabric; the third proves it was crossed, since the
+/// server had to receive the request to reject it.
+///
+/// Distinct from -1 so these skip both the retry and the rail-failure report.
+/// Charging a rail here takes healthy hardware out of rotation over an
+/// application mistake -- a missing bucket drove `healthy_nic_count()` to 0 on
+/// a two-rail host -- and the same error would repeat on the next rail anyway.
+const RDMA_NO_RAIL_FAULT: isize = -3;
+
+/// The two sentinels must stay distinct and negative: `from_ssize` tells them
+/// apart by value, and the retry loops route on them.
+const _: () = {
+    assert!(RDMA_NO_RAIL_FAULT != RDMA_NOT_SUPPORTED);
+    assert!(RDMA_NO_RAIL_FAULT != -1);
+    assert!(RDMA_NO_RAIL_FAULT < 0);
+};
 
 const RDMA_MAX_ATTEMPTS: u32 = 2;
 const RDMA_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -88,9 +107,10 @@ impl RdmaOutcome {
     }
 }
 
-/// Extract the client NIC IP from the 81-char RDMA token, matching libcuobjclient
-/// 1.2.0+'s IPv4-mapped IPv6 GID layout ("...ffffAABBCCDD"). Returns `None` for
-/// older clients or non-multipath tokens.
+/// Extract the client NIC IP from the 81-char RDMA token, whose trailing 32
+/// hex chars are the source NIC's GID. Returns `None` unless that GID is an
+/// IPv4-mapped IPv6 address ("...ffffAABBCCDD"), which is what a RoCEv2 GID
+/// over IPv4 looks like -- an IB or IPv6 GID names no address to pin to.
 pub fn parse_client_nic_from_token(token: &str) -> Option<IpAddr> {
     let bytes = token.as_bytes();
     if bytes.len() < 32 {
@@ -128,16 +148,15 @@ pub fn parse_rdma_reply(reply: &str) -> i32 {
 
 /// Cache of `reqwest::Client`s keyed by local NIC IP, used so a token that
 /// embedded a specific HCA's GID sends its HTTP control-plane out the same
-/// interface. Without this, multipath can split TCP and RDMA across NICs and
-/// the server's RDMA_READ has no healthy path back. Matches the C++ port's
-/// `CURLOPT_INTERFACE` behaviour.
+/// interface. Without this a multi-NIC host can split TCP and RDMA across
+/// NICs, and the server's RDMA_READ has no path back to the token's peer.
 static NIC_CLIENT_CACHE: LazyLock<DashMap<IpAddr, Arc<reqwest::Client>>> =
     LazyLock::new(DashMap::new);
 
-/// Default RDMA control-plane client when the token carries no NIC GID
-/// (older libcuobjclient, single-HCA). Kept in a LazyLock so the aggressive
-/// connect/total timeouts the C++ port always applies are present even when
-/// NIC pinning is unavailable, and so we don't allocate a fresh client per op.
+/// Default RDMA control-plane client, used when the token names no pinnable
+/// address (single-HCA host, IB or IPv6 GID). Kept in a LazyLock so the
+/// aggressive connect/total timeouts still apply when NIC pinning is
+/// unavailable, and so we don't allocate a fresh client per op.
 static DEFAULT_RDMA_CLIENT: LazyLock<Arc<reqwest::Client>> = LazyLock::new(|| {
     let c = reqwest::Client::builder()
         .tcp_nodelay(true)
@@ -192,7 +211,7 @@ pub async fn rdma_put(
     if let Some(upload_id) = &ctx.upload_id {
         query_params.add("uploadId", upload_id.as_str());
         if ctx.part_number == 0 || ctx.part_number > 10000 {
-            return -1;
+            return RDMA_NO_RAIL_FAULT;
         }
         query_params.add("partNumber", ctx.part_number.to_string());
     }
@@ -205,7 +224,7 @@ pub async fn rdma_put(
         Some(&ctx.object),
     ) {
         Ok(u) => u,
-        Err(_) => return -1,
+        Err(_) => return RDMA_NO_RAIL_FAULT,
     };
 
     let date = utc_now();
@@ -292,6 +311,14 @@ pub async fn rdma_put(
         if reply_code == RDMA_NOT_SUPPORTED as i32 {
             return RDMA_NOT_SUPPORTED;
         }
+        // `x-amz-rdma-reply` is the RDMA status channel. Absent, the server
+        // failed at the S3 layer -- a missing bucket answers 404, a busy node
+        // 503 -- having received this request over the rail, which is proof
+        // the rail carried it. Retrying gains nothing the fallback to HTTP
+        // does not, and charging the rail sidelines working hardware.
+        if reply.is_empty() || status.is_client_error() {
+            return RDMA_NO_RAIL_FAULT;
+        }
         return -1;
     }
 
@@ -329,7 +356,7 @@ pub async fn rdma_get(
         Some(&ctx.object),
     ) {
         Ok(u) => u,
-        Err(_) => return -1,
+        Err(_) => return RDMA_NO_RAIL_FAULT,
     };
 
     let date = utc_now();
@@ -377,6 +404,7 @@ pub async fn rdma_get(
         Err(_) => return -1,
     };
 
+    let status = resp.status();
     let resp_headers = resp.headers().clone();
     let reply = resp_headers
         .get(X_AMZ_RDMA_REPLY)
@@ -387,6 +415,10 @@ pub async fn rdma_get(
         return RDMA_NOT_SUPPORTED;
     }
     if reply_code != RDMA_REPLY_SUCCESS && reply_code != RDMA_REPLY_PARTIAL_CONTENT {
+        // See rdma_put: no RDMA status means the failure was not the rail's.
+        if reply.is_empty() || status.is_client_error() {
+            return RDMA_NO_RAIL_FAULT;
+        }
         return -1;
     }
 
@@ -407,10 +439,16 @@ pub async fn rdma_get(
     size as isize
 }
 
-/// Mirror of C++ `rdmaPutWithRetry`. Caller must have already registered the
-/// buffer via [`CuObjClient::get_descriptor`].
-pub async fn rdma_put_with_retry(
-    rdma: &CuObjClient,
+/// PUT a registered buffer, retrying a transient RDMA failure once.
+///
+/// # Safety
+/// `buf_ptr` must point to a `size`-byte region that stays valid, and is not
+/// concurrently mutated, for the whole call. `rdma` must hold a live
+/// registration covering it -- see [`ScopedRegistration`](super::ScopedRegistration).
+/// The remote reads that memory directly, so a stale pointer is a use-after-free
+/// the caller never observes locally.
+pub async unsafe fn rdma_put_with_retry(
+    rdma: &RdmaClient,
     client: &MinioClient,
     ctx: &mut S3RdmaClientCtx,
     buf_ptr: *mut libc::c_void,
@@ -418,22 +456,38 @@ pub async fn rdma_put_with_retry(
 ) -> RdmaOutcome {
     let mut last: isize = -1;
     for _ in 0..RDMA_MAX_ATTEMPTS {
-        let token = match unsafe { rdma.get_rdma_token(buf_ptr, size, 0, OpType::Put) } {
+        let token = match unsafe { rdma.get_rdma_token(buf_ptr, size, 0) } {
             Some(t) => t,
             None => return RdmaOutcome::Failed,
         };
         last = rdma_put(client, ctx, token.as_cstr(), size as u64).await;
-        drop(token);
-        if last > 0 || last == RDMA_NOT_SUPPORTED {
+        if last > 0 || last == RDMA_NOT_SUPPORTED || last == RDMA_NO_RAIL_FAULT {
+            drop(token);
             break;
         }
+        // The transfer failed on the wire. Charge it to the rail this token
+        // named, so the next request skips that rail rather than
+        // round-robinning back onto it. Two results are excluded above: a 501,
+        // because the server declining RDMA says nothing about the rail, and a
+        // local error, because nothing was ever sent.
+        //
+        // A server-side failure marks every rail in turn, which is safe: the
+        // library clears all marks once no rail is left usable, so a fault
+        // that was never the fabric's heals itself.
+        rdma.report_token_failure(token.as_cstr());
+        drop(token);
     }
     RdmaOutcome::from_ssize(last, size)
 }
 
-/// Mirror of C++ `rdmaGetWithRetry`.
-pub async fn rdma_get_with_retry(
-    rdma: &CuObjClient,
+/// GET into a registered buffer.
+///
+/// # Safety
+/// Same contract as [`rdma_put_with_retry`]: `buf_ptr` must name a live,
+/// registered `size`-byte region for the whole call. The remote writes into
+/// that memory directly.
+pub async unsafe fn rdma_get_with_retry(
+    rdma: &RdmaClient,
     client: &MinioClient,
     ctx: &mut S3RdmaClientCtx,
     buf_ptr: *mut libc::c_void,
@@ -441,15 +495,18 @@ pub async fn rdma_get_with_retry(
 ) -> RdmaOutcome {
     let mut last: isize = -1;
     for _ in 0..RDMA_MAX_ATTEMPTS {
-        let token = match unsafe { rdma.get_rdma_token(buf_ptr, size, 0, OpType::Get) } {
+        let token = match unsafe { rdma.get_rdma_token(buf_ptr, size, 0) } {
             Some(t) => t,
             None => return RdmaOutcome::Failed,
         };
         last = rdma_get(client, ctx, token.as_cstr(), size as u64).await;
-        drop(token);
-        if last > 0 || last == RDMA_NOT_SUPPORTED {
+        if last > 0 || last == RDMA_NOT_SUPPORTED || last == RDMA_NO_RAIL_FAULT {
+            drop(token);
             break;
         }
+        // See rdma_put_with_retry: take the failing rail out of rotation.
+        rdma.report_token_failure(token.as_cstr());
+        drop(token);
     }
     RdmaOutcome::from_ssize(last, size)
 }
@@ -484,5 +541,21 @@ mod tests {
     #[test]
     fn parse_nic_rejects_short_token() {
         assert!(parse_client_nic_from_token("short").is_none());
+    }
+
+    #[test]
+    fn a_local_error_reports_as_a_failed_transfer() {
+        assert!(matches!(
+            RdmaOutcome::from_ssize(RDMA_NO_RAIL_FAULT, 4096),
+            RdmaOutcome::Failed
+        ));
+        assert!(matches!(
+            RdmaOutcome::from_ssize(RDMA_NOT_SUPPORTED, 4096),
+            RdmaOutcome::Declined
+        ));
+        assert!(matches!(
+            RdmaOutcome::from_ssize(-1, 4096),
+            RdmaOutcome::Failed
+        ));
     }
 }
